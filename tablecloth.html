@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cloth Draping — Mass &amp; Springs (square)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0e1116; }
+  #hud {
+    position: fixed; top: 14px; left: 14px; z-index: 10;
+    font-family: system-ui, sans-serif; color: #cfd8e3;
+    background: rgba(10,14,20,.55); border: 1px solid rgba(255,255,255,.08);
+    padding: 12px 14px; border-radius: 10px; backdrop-filter: blur(6px);
+    user-select: none;
+  }
+  #hud h1 { font-size: 14px; margin: 0 0 6px; font-weight: 600; letter-spacing: .2px; }
+  #hud p  { font-size: 12px; margin: 3px 0; opacity: .75; }
+  button {
+    margin-top: 10px; font: inherit; font-size: 13px; cursor: pointer;
+    background: #2f6df6; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px;
+  }
+  button:hover { background: #4a80ff; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>Square Cloth → Round Table (mass + springs, semi-implicit Euler)</h1>
+  <p>Drag&nbsp;·&nbsp;orbit &nbsp;|&nbsp; Scroll&nbsp;·&nbsp;zoom</p>
+  <p>Point, rim-edge &amp; floor contact on all grid segments</p>
+  <button id="drop">Drop again</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ============================ SCENE ============================ */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e1116);
+scene.fog = new THREE.Fog(0x0e1116, 17, 37);   // was 14, 34 — shifted with the camera pull-back so the look stays the same
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(6.8, 5.5, 9.5);           // pulled back ~25% along the same view direction
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 1.1, 0);
+controls.minDistance = 3;
+controls.maxDistance = 22;
+controls.maxPolarAngle = Math.PI * 0.495;
+
+scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x1a1f2b, 0.75));
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(6, 10, 5);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.near = 1; key.shadow.camera.far = 30;
+key.shadow.camera.left = -8; key.shadow.camera.right = 8;
+key.shadow.camera.top = 8;   key.shadow.camera.bottom = -8;
+key.shadow.bias = -0.0004;
+scene.add(key);
+const fill = new THREE.DirectionalLight(0x88aaff, 0.35);
+fill.position.set(-6, 4, -4);
+scene.add(fill);
+
+/* ============================ TABLE ============================ */
+const TABLE_RADIUS = 2.1;
+const PED_H       = 1.44 * 1.25 * 1.25 * 1.25;  // pedestal 25% taller again: 2.25 -> 2.8125
+const TABLE_TOP_Y = PED_H + 0.16;               // -> 2.9725
+
+const woodMat  = new THREE.MeshStandardMaterial({ color: 0x9a6b3f, roughness: 0.65, metalness: 0.05 });
+const darkMat  = new THREE.MeshStandardMaterial({ color: 0x3a2c20, roughness: 0.8 });
+const table = new THREE.Group();
+
+const top = new THREE.Mesh(new THREE.CylinderGeometry(TABLE_RADIUS, TABLE_RADIUS, 0.16, 72), woodMat);
+top.position.y = TABLE_TOP_Y - 0.08; top.castShadow = top.receiveShadow = true; table.add(top);
+const rim = new THREE.Mesh(new THREE.TorusGeometry(TABLE_RADIUS, 0.05, 16, 72), darkMat);
+rim.rotation.x = Math.PI / 2; rim.position.y = TABLE_TOP_Y - 0.16; table.add(rim);
+const ped = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, PED_H, 32), darkMat);
+ped.position.y = PED_H / 2; ped.castShadow = ped.receiveShadow = true; table.add(ped);
+const base = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.25, 0.14, 48), darkMat);
+base.position.y = 0.07; base.receiveShadow = true; table.add(base);
+scene.add(table);
+
+const ground = new THREE.Mesh(new THREE.CircleGeometry(30, 64),
+  new THREE.MeshStandardMaterial({ color: 0x141a24, roughness: 1 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+/* ============================ CLOTH (square, mass + spring) ============================ */
+const GRID   = 52;   // doubled from 26 -> 51x51 cloth cells
+const C_SIZE = 6.0;               // square side -> ~0.9 edge overhang, big corner drape
+const SPACING = C_SIZE / (GRID - 1);
+
+const GRAVITY_Y = -9.8;
+// Material constants scaled for the 2x resolution (continuum-consistent with the old 26-grid):
+//   MASS     ~ cell area    (h halved -> m/4)  so total cloth mass is unchanged
+//   K_STRUCT ~ 1/spacing    (h halved -> k x2) so a row of springs-in-series keeps its stiffness
+//   K_BEND   ~ 1/spacing^2  (h halved -> k x4) so total fold resistance per area is unchanged
+const MASS      = 0.3 / 4;        // -> 0.075
+const K_STRUCT  = 350.0 * 2;      // -> 700
+const K_BEND    = 60.0 * 4;       // -> 240
+// Air drag, per node. The whole-cloth drag is what resists sliding (2704 nodes x c),
+// so match the OLD cloth's effective value: old total = 676 nodes x 0.55 = 372 N*s/m
+// -> c = 372 / 2704 = 0.1375 was the area-consistent value, but even that left a
+// ~1.1 N*s/kg whole-cloth drag (4x the old 0.28) that stalled the slide. 0.0625
+// restores the old per-mass drag exactly; the damping RATIO c/(2*sqrt(k*m)) is
+// unchanged from 0.1375, so ripple settling looks the same.
+const AIR_DRAG  = 0.0625;
+const SUBSTEPS  = 28;             // was 14: finer h keeps the faster spring modes (now ~3x higher freq)
+                                  // integrated as accurately as before, and makes the rim projection land in smaller steps
+// Contact friction, as velocity kept PER SECOND (the raw multiplier is applied every
+// SUBSTEP, so it must be defined this way to be substep-count independent):
+//   FRICTION_SUB = FRICTION^(1/SUBSTEPS)
+// 0.85/s: light tabletop grip — the overhang's pull needs to beat this to slide the cloth.
+const FRICTION        = 0.85;
+const FRICTION_SUB    = Math.pow(FRICTION, 1 / SUBSTEPS);   // ~= 0.9994 per substep
+// CLR is a geometric offset, so it must scale with spacing like the mesh:
+// at the 26-grid 0.12 was ~half a cell; at the 52-grid it was a full cell -> a thick
+// contact cushion + rim collar that re-excited the edge every substep (wild rim ripples).
+const CLR       = 0.06;
+const START_Y   = 5.2;            // higher drop: with the lighter drag the impact is ~3 m/s,
+                                  // and the extra fall energy is what gets the slide started
+// Drop well off-centre: with a smaller offset the TRAILING sides still overhang the rim
+// and their drape pulls back almost as hard as the leading drape -> the cloth swings a
+// little, the drapes balance, and it stops. 0.85/0.55 leaves the short side with almost
+// no overhang, so the net pull keeps growing the further it slides -> it runs off.
+const OFF_X     = 0.85;
+const OFF_Z     = 0.55;
+
+const N = GRID * GRID;
+const px = new Float32Array(N), py = new Float32Array(N), pz = new Float32Array(N);
+const vx = new Float32Array(N), vy = new Float32Array(N), vz = new Float32Array(N);
+const pinned = new Uint8Array(N);
+const radial = i => Math.hypot(px[i], pz[i]);
+
+function resetCloth() {
+  for (let z = 0; z < GRID; z++) for (let x = 0; x < GRID; x++) {
+    const i = z * GRID + x;
+    px[i] = (x - (GRID - 1) / 2) * SPACING + OFF_X;
+    py[i] = START_Y;
+    pz[i] = (z - (GRID - 1) / 2) * SPACING + OFF_Z;
+    vx[i] = vy[i] = vz[i] = 0;
+    pinned[i] = 0;
+  }
+}
+resetCloth();
+
+// springs
+const springs = [];
+function addSpring(a, b, k) {
+  const dx = px[a]-px[b], dy = py[a]-py[b], dz = pz[a]-pz[b];
+  const rest = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  if (rest > 1e-5) springs.push({ a, b, rest, k });
+}
+// structural (horizontal + vertical)
+for (let z = 0; z < GRID; z++) for (let x = 0; x < GRID; x++) {
+  const i = z * GRID + x;
+  if (x < GRID - 1) addSpring(i, i + 1, K_STRUCT);
+  if (z < GRID - 1) addSpring(i, i + GRID, K_STRUCT);
+}
+// shear (diagonals)
+for (let z = 0; z < GRID - 1; z++) for (let x = 0; x < GRID - 1; x++) {
+  const i = z * GRID + x;
+  addSpring(i, i + GRID + 1, K_STRUCT);
+  addSpring(i + 1, i + GRID, K_STRUCT);
+}
+// bend (two apart)
+for (let z = 0; z < GRID; z++) for (let x = 0; x < GRID; x++) {
+  const i = z * GRID + x;
+  if (x < GRID - 2) addSpring(i, i + 2, K_BEND);
+  if (z < GRID - 2) addSpring(i, i + GRID * 2, K_BEND);
+}
+
+/* mesh — red & white checked.
+   The check pattern is baked into a small canvas texture and sampled via UVs.
+   (Per-vertex colors can't produce checks: each vertex is shared by 4 quads, so the
+   2-red/2-white corner mix interpolates across each quad -> diagonal stripes.) */
+const CHECKS  = 49;               // checks per side — one per cloth cell (GRID - 1)
+const CELL_PX = 32;
+const cnv = document.createElement("canvas");
+cnv.width = cnv.height = CHECKS * CELL_PX;
+const cctx = cnv.getContext("2d");
+for (let cz = 0; cz < CHECKS; cz++) for (let cx = 0; cx < CHECKS; cx++) {
+  cctx.fillStyle = ((cx + cz) & 1) === 0 ? "#f6f2ea" : "#d14440";
+  cctx.fillRect(cx * CELL_PX, cz * CELL_PX, CELL_PX, CELL_PX);
+}
+const checkTex = new THREE.CanvasTexture(cnv);
+checkTex.colorSpace = THREE.SRGBColorSpace;
+checkTex.anisotropy = renderer.capabilities.getMaxAnisotropy();  // stays crisp at grazing angles
+
+const clothMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide,
+  map: checkTex
+});
+const clothGeo = new THREE.BufferGeometry();
+const posAttr  = new THREE.BufferAttribute(new Float32Array(N * 3), 3);
+posAttr.setUsage(THREE.DynamicDrawUsage);
+clothGeo.setAttribute("position", posAttr);
+const uvAttr = new THREE.BufferAttribute(new Float32Array(N * 2), 2);
+for (let z = 0; z < GRID; z++) for (let x = 0; x < GRID; x++) {
+  const i = z * GRID + x;
+  uvAttr.array[i*2]   = x / (GRID - 1);
+  uvAttr.array[i*2+1] = z / (GRID - 1);
+}
+clothGeo.setAttribute("uv", uvAttr);
+const idx = [];
+for (let z = 0; z < GRID - 1; z++) for (let x = 0; x < GRID - 1; x++) {
+  const a = z*GRID + x, b = a + 1, c = a + GRID, d = c + 1;
+  idx.push(a, b, d, a, d, c);
+}
+clothGeo.setIndex(idx);
+const clothMesh = new THREE.Mesh(clothGeo, clothMat);
+clothMesh.castShadow = true;
+scene.add(clothMesh);
+
+/* ============================ PHYSICS ============================ */
+const fx = new Float32Array(N), fy = new Float32Array(N), fz = new Float32Array(N);
+
+function closestOnTable(X, Y, Z, out) {
+  const r = Math.hypot(X, Z);
+  const clampedY = Math.max(0, Math.min(TABLE_TOP_Y, Y));
+  if (r <= TABLE_RADIUS) { out.x = X; out.y = clampedY; out.z = Z; }
+  else { const s = TABLE_RADIUS / r; out.x = X*s; out.y = clampedY; out.z = Z*s; }
+}
+const _cp = { x: 0, y: 0, z: 0 };
+
+function resolvePoint(i) {
+  closestOnTable(px[i], py[i], pz[i], _cp);
+  let dx = px[i]-_cp.x, dy = py[i]-_cp.y, dz = pz[i]-_cp.z;
+  let d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  if (d >= CLR) return;
+  if (d < 1e-6) { dx = 0; dy = 1; dz = 0; d = 1; }
+  const nx = dx/d, ny = dy/d, nz = dz/d;
+  px[i] = _cp.x + nx*CLR; py[i] = _cp.y + ny*CLR; pz[i] = _cp.z + nz*CLR;
+  const vn = vx[i]*nx + vy[i]*ny + vz[i]*nz;
+  if (vn < 0) { vx[i] -= vn*nx; vy[i] -= vn*ny; vz[i] -= vn*nz; }
+  vx[i] *= FRICTION_SUB; vy[i] *= FRICTION_SUB; vz[i] *= FRICTION_SUB;
+}
+
+// floor contact: the ground plane at y = 0. The table collision only covers the
+// tabletop disc and the rim wall, so anything that slides off and drops past the rim
+// used to fall straight through the (visual-only) floor. Same projection + friction
+// treatment as the table: nodes can't penetrate y = 0, and contact damps them, so the
+// offloaded cloth lands and piles up on the ground instead of vanishing.
+function resolveFloor(i) {
+  if (py[i] >= CLR) return;
+  py[i] = CLR;
+  if (vy[i] < 0) vy[i] = 0;
+  vx[i] *= FRICTION_SUB; vz[i] *= FRICTION_SUB;
+}
+
+// rim-edge contact: a segment crossing the rim keeps its OUTER end outside the rim circle.
+// The inner end is deliberately left alone: it sits on the tabletop and is handled by
+// resolvePoint() (which damps it). Projecting the inner end out to R+CLR every substep
+// was teleporting on-table nodes into the air and re-injecting energy -> twitching.
+function resolveRimEdge(a, b) {
+  const ra = radial(a), rb = radial(b);
+  if (!(Math.min(ra, rb) < TABLE_RADIUS && Math.max(ra, rb) > TABLE_RADIUS)) return;
+  if (Math.max(py[a], py[b]) < TABLE_TOP_Y - 0.02) return;      // both ends already below the top
+  const o = (ra >= rb) ? a : b;                                 // outer endpoint
+  const th = Math.atan2(pz[o], px[o]);
+  const ux = Math.cos(th), uz = Math.sin(th);
+  if (px[o]*ux + pz[o]*uz < TABLE_RADIUS + CLR && py[o] < TABLE_TOP_Y + CLR) {
+    const cur = Math.hypot(px[o], pz[o]) || 1e-5;
+    px[o] = (px[o]/cur) * (TABLE_RADIUS + CLR);
+    pz[o] = (pz[o]/cur) * (TABLE_RADIUS + CLR);
+    // remove inward radial velocity, apply friction (same treatment as resolvePoint)
+    const vr = vx[o]*ux + vz[o]*uz;
+    if (vr < 0) { vx[o] -= vr*ux; vz[o] -= vr*uz; }
+    vx[o] *= FRICTION_SUB; vz[o] *= FRICTION_SUB;
+  }
+}
+
+function substep(h) {
+  for (let i = 0; i < N; i++) {
+    if (pinned[i]) { fx[i] = fy[i] = fz[i] = 0; continue; }
+    fx[i] = -AIR_DRAG * vx[i];
+    fy[i] = MASS * GRAVITY_Y - AIR_DRAG * vy[i];
+    fz[i] = -AIR_DRAG * vz[i];
+  }
+  const invM = 1 / MASS;
+  for (let s = 0; s < springs.length; s++) {
+    const sp = springs[s], a = sp.a, b = sp.b;
+    const dx = px[b]-px[a], dy = py[b]-py[a], dz = pz[b]-pz[a];
+    const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (len === 0) continue;
+    const F = sp.k * (len - sp.rest);
+    const ux = dx/len, uy = dy/len, uz = dz/len;
+    const Fx = F*ux, Fy = F*uy, Fz = F*uz;
+    if (!pinned[a]) { fx[a] += Fx; fy[a] += Fy; fz[a] += Fz; }
+    if (!pinned[b]) { fx[b] -= Fx; fy[b] -= Fy; fz[b] -= Fz; }
+  }
+  for (let i = 0; i < N; i++) {
+    if (pinned[i]) { vx[i] = vy[i] = vz[i] = 0; continue; }
+    vx[i] += fx[i]*invM*h; vy[i] += fy[i]*invM*h; vz[i] += fz[i]*invM*h;
+    px[i] += vx[i]*h; py[i] += vy[i]*h; pz[i] += vz[i]*h;
+  }
+  // collisions: points (table, then floor), then every grid segment that crosses the rim
+  for (let i = 0; i < N; i++) if (!pinned[i]) { resolvePoint(i); resolveFloor(i); }
+  for (let z = 0; z < GRID; z++) for (let x = 0; x < GRID; x++) {
+    const i = z * GRID + x;
+    if (x < GRID - 1) resolveRimEdge(i, i + 1);        // horizontal
+    if (z < GRID - 1) resolveRimEdge(i, i + GRID);     // vertical
+  }
+}
+
+function step(dt) {
+  const h = dt / SUBSTEPS;
+  for (let s = 0; s < SUBSTEPS; s++) substep(h);
+  const arr = posAttr.array;
+  for (let i = 0; i < N; i++) { arr[i*3] = px[i]; arr[i*3+1] = py[i]; arr[i*3+2] = pz[i]; }
+  posAttr.needsUpdate = true;
+  clothGeo.computeVertexNormals();
+}
+
+/* ============================ LOOP ============================ */
+const clock = new THREE.Clock();
+const FIXED = 1 / 60;
+let acc = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  let dt = clock.getDelta();
+  if (dt > 1 / 30) dt = 1 / 30;
+  acc += dt;
+  while (acc >= FIXED) { step(FIXED); acc -= FIXED; }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+document.getElementById("drop").addEventListener("click", resetCloth);
+</script>
+</body>
+</html>
