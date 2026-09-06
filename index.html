@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rainbow Slinky vs. the Up-Escalator</title>
+<style>
+  :root {
+    --bg0: #10141f;
+    --bg1: #1a2233;
+    --ink: #e8ecf4;
+    --dim: #8b95ab;
+    --accent: #ff5d5d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: radial-gradient(1200px 700px at 50% 20%, #1b2338 0%, var(--bg0) 60%, #0a0d15 100%);
+    color: var(--ink);
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #stage {
+    position: relative;
+    width: min(96vw, 960px);
+    user-select: none;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 14px;
+    box-shadow: 0 30px 80px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
+    background: #131926;
+  }
+  #hud {
+    position: absolute; top: 14px; left: 18px; right: 18px;
+    display: flex; justify-content: space-between; align-items: flex-start;
+    pointer-events: none;
+  }
+  #hud h1 {
+    font-size: 17px; letter-spacing: .12em; text-transform: uppercase; font-weight: 800;
+    background: linear-gradient(90deg,#ff4d4d,#ffa94d,#ffe94d,#7bffa9,#4dd7ff,#7d7bff,#ff6ad5);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #hud .sub { font-size: 11px; color: var(--dim); letter-spacing: .08em; margin-top: 3px; }
+  #status {
+    font-size: 12px; text-align: right; color: var(--ink);
+    background: rgba(10,14,22,.55); border: 1px solid rgba(255,255,255,.08);
+    padding: 8px 12px; border-radius: 10px; backdrop-filter: blur(6px);
+    line-height: 1.5; max-width: 260px;
+  }
+  #status b { color: #ffd76a; font-weight: 700; }
+  #controls {
+    display: flex; gap: 12px; align-items: center; justify-content: center;
+    margin-top: 14px;
+  }
+  button {
+    font: inherit; font-weight: 700; letter-spacing: .06em;
+    padding: 11px 30px; border-radius: 12px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.14);
+    transition: transform .08s ease, box-shadow .2s ease, filter .2s ease;
+  }
+  button:active { transform: translateY(1px) scale(.98); }
+  #dropBtn {
+    background: linear-gradient(180deg, #ff6a5e, #e6402f);
+    color: #fff; border-color: rgba(255,120,90,.5);
+    box-shadow: 0 8px 24px rgba(230,64,47,.35);
+  }
+  #dropBtn:disabled { filter: grayscale(.7) brightness(.7); cursor: default; box-shadow: none; }
+  #resetBtn {
+    background: rgba(255,255,255,.07);
+    color: var(--ink);
+  }
+  #resetBtn:hover { background: rgba(255,255,255,.12); }
+  #dropBtn:hover:not(:disabled) { box-shadow: 0 10px 30px rgba(230,64,47,.5); }
+  .hint { font-size: 11px; color: var(--dim); margin-left: 8px; }
+  .hint kbd {
+    background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.15);
+    border-radius: 4px; padding: 1px 6px; font-family: inherit; font-size: 10px;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c" width="960" height="600"></canvas>
+  <div id="hud">
+    <div>
+      <h1>Rainbow Slinky</h1>
+      <div class="sub">vs. the up-escalator &mdash; it walks down, the escalator walks up</div>
+    </div>
+    <div id="status">warming up&hellip;</div>
+  </div>
+  <div id="controls">
+    <button id="dropBtn">Drop</button>
+    <button id="resetBtn">Reset</button>
+    <span class="hint"><kbd>space</kbd> drop &nbsp; <kbd>R</kbd> reset</span>
+  </div>
+</div>
+
+<script>
+"use strict";
+/*PHYSICS-START*/
+/* Self-contained physics for a slinky (chain of spring coils) on a moving
+   escalator (sawtooth step profile that scrolls up its own slope).
+   No DOM access in this block so it can also be run headless in Node. */
+const PHYSICS = (() => {
+  // Defaults. Every value can be overridden per-simulation via the `over`
+  // argument of createSim(), which makes headless parameter tuning easy.
+  const P0 = {
+    N: 28,            // number of coils
+    L0: 13,           // rest length of one link (px)
+    R: 4.5,           // coil radius (px)
+    TW: 64,           // step tread width (px)
+    RH: 36,           // step riser height (px)
+    X0: -256,         // world x of left edge of tread 0
+    Y0: 20,           // world y (top surface) of tread 0
+    G: 2300,          // gravity (px/s^2)
+    DT: 1 / 240,      // integration step (s)
+    ITER: 10,         // constraint solver iterations
+    STRETCH_K: 0.9,   // link stretch stiffness (per iteration)
+    COMPRESS_K: 0.5,  // link over-compression stiffness
+    L_MIN_FRAC: 0.10, // minimum link length as fraction of L0 (coils can nest)
+    BEND_K: 0.05,     // weak anti-kink stiffness (i-1 .. i+1)
+    NEST_K: 0.5,      // coil self-collision: stiffness of the k..k+2 constraint
+    D_NEST: 5.2,      // min distance between coils two apart (px, ~ nested pair spacing)
+    DAMP: 0.999,      // velocity damping per step
+    V_CAP: 1500,      // speed cap (px/s)
+    FRICTION: 0.55,   // velocity blending toward step surface speed while in contact
+    V_BASE: 95,       // escalator speed at zero COM error (px/s, up the slope)
+    V_IDLE_FRAC: 0.22,// escalator speed while the slinky is being held
+    KP: 0.42,         // feedback gain: extra step speed per px of COM error
+    ERR_CLAMP: 320,   // clamp on COM error fed into the controller
+    V_MIN: 10,        // escalator speed clamp (px/s)
+    V_SPEED_MAX: 360, // escalator speed clamp (px/s)
+    TAU: 1.25,        // escalator speed smoothing time constant (s)
+    COM_TARGET_X: 380,// where we want the slinky's center of mass (world px)
+    COM_TARGET_Y: 330,
+  };
+
+  function makeSim(over) {
+    const P = Object.assign({}, P0, over || {});
+    const theta = Math.atan2(P.RH, P.TW);
+    const cT = Math.cos(theta);   // downhill unit x
+    const sT = Math.sin(theta);   // downhill unit y
+    const N = P.N;
+    const FOLD = N >> 1;          // index of the middle coil (the horseshoe apex)
+
+    const pts = new Array(N);
+    for (let i = 0; i < N; i++) pts[i] = { x: 0, y: 0, px: 0, py: 0 };
+
+    const S = {
+      P, pts, N, FOLD, theta, cT, sT,
+      t: 0,
+      scroll: 0,        // distance the steps have traveled up the slope (px)
+      vStep: 0,         // current escalator speed (px/s, positive = up slope)
+      mode: "held",     // "held" | "tumbling"
+      anchor: { x: 0, y: 0, px: 0, py: 0 },
+      comS: 0,          // center of mass in slope coordinates
+      comX: 0, comY: 0,
+      contactCount: 0,  // coils in contact this step (debug)
+    };
+
+    // World position of the top surface of the step whose tread contains the
+    // base-profile x coordinate `xb`. The whole profile translates by
+    // -scroll*(cT, sT), i.e. up and to the left.
+    function stepAt(xb) {
+      const i = Math.floor(xb / P.TW);
+      return { i, u: xb - i * P.TW, y: P.Y0 + i * P.RH - S.scroll * sT };
+    }
+
+    // World position of a point fixed in the step frame (u along tread from
+    // its left edge, h above the tread top of step i).
+    function stepPoint(i, u, h) {
+      return {
+        x: P.X0 + i * P.TW + u - S.scroll * cT,
+        y: P.Y0 + i * P.RH - S.scroll * sT - h,
+      };
+    }
+
+    // The anchor step is whichever step's tread is nearest the COM target.
+    function anchorStepIndex(scroll) {
+      const xb = P.COM_TARGET_X - P.X0 + scroll * cT;
+      return Math.round(xb / P.TW - 0.5);
+    }
+
+    // Target world position of coil k in the held pose at the current scroll:
+    // a horseshoe with the fold on the nosing of the anchor step and both
+    // arms hanging as tight nested bundles in front of the edge, ends
+    // resting exactly on the tread below. Safe by construction (no coil is
+    // inside the step solid), so held mode can enforce it kinematically.
+    const SLOP_A = 5, SLOP_B = 14;   // x drift of each arm (keeps them nested
+                                      // but visibly separated)
+    function heldPose(k) {
+      const i = S.anchorStep;
+      const fx = P.X0 + (i + 1) * P.TW - S.scroll * cT;  // nosing x (front edge)
+      const fy = P.Y0 + i * P.RH - S.scroll * sT - P.R;  // resting on the tread
+      const DROP = P.RH;
+      if (k === FOLD) return { x: fx, y: fy };
+      if (k < FOLD) {
+        const q = (FOLD - k) / FOLD;   // 1 at the end, 0 at the fold
+        return { x: fx + SLOP_A * q, y: fy + DROP * q };
+      }
+      const q = (k - FOLD) / (N - 1 - FOLD);
+      return { x: fx + SLOP_B * q, y: fy + DROP * q };
+    }
+
+    function placeHeld() {
+      // Set every coil to the held pose with zero velocity in the step frame
+      // (== the world velocity of the moving surface).
+      const i = anchorStepIndex(S.scroll);
+      S.anchorStep = i;
+      const dt = P.DT;
+      const svx = -S.vStep * cT, svy = -S.vStep * sT;
+      for (let k = 0; k < N; k++) {
+        const p = S.pts[k];
+        const tp = heldPose(k);
+        p.x = tp.x; p.y = tp.y;
+        p.px = tp.x - svx * dt; p.py = tp.y - svy * dt;
+      }
+      const c = S.pts[FOLD];
+      S.anchor.x = c.x; S.anchor.y = c.y;
+      S.anchor.px = c.px; S.anchor.py = c.py;
+    }
+
+    function drop() {
+      if (S.mode !== "held") return;
+      S.mode = "tumbling";
+      // tiny asymmetric nudge so the flip starts cleanly
+      for (let k = 0; k < N; k++) {
+        const p = S.pts[k];
+        p.py += 0.05;
+        p.px += (k < FOLD ? -0.05 : 0.05);
+      }
+    }
+
+    function reset() {
+      S.mode = "held";
+      S.t = 0;
+      // vStep is left as-is; the held controller eases it to idle speed.
+      placeHeld();
+    }
+
+    // ---- collision with the scrolling step profile -----------------------
+    // Pushes the coil out of the solid, zeroes the inward normal velocity
+    // (inelastic), and blends the tangential velocity toward the moving
+    // step surface (friction). Returns true on contact.
+    function collide(p) {
+      const sc = S.scroll;
+      const xb = p.x - P.X0 + sc * cT;
+      const i = Math.floor(xb / P.TW);
+      const yTop = P.Y0 + i * P.RH - sc * sT;       // tread top under p.x
+      const xr = P.X0 + (i + 1) * P.TW - sc * cT;   // riser x under p.x
+      const r = P.R;
+      let nx = 0, ny = -1, pen = 0;
+
+      // tread (solid below)
+      if (p.y > yTop - r) {
+        pen = p.y - (yTop - r);
+        nx = 0; ny = -1;
+      }
+      // riser face (solid to its left): only coils in the air in front of it
+      if (p.x > xr && p.x - xr < r && p.y > yTop - r && p.y < yTop + P.RH + r) {
+        const pr = (xr + r) - p.x;
+        if (pr > 0 && pr > pen) { pen = pr; nx = 1; ny = 0; }
+      }
+      if (pen <= 0) return false;
+
+      // Velocity BEFORE the pushout. The pushout must move the position only:
+      // if we read the velocity after pushing, the penetration `pen` is baked
+      // into the coil's velocity every substep. On a rising tread that injects
+      // unbalanced upward velocity continuously and launches the chain up the
+      // escalator. Projecting the pre-pushout velocity keeps the carry as a
+      // pure position change (the coil tracks the tread without gaining speed).
+      let vx = p.x - p.px, vy = p.y - p.py;
+      p.x += nx * pen;
+      p.y += ny * pen;
+      const vn = vx * nx + vy * ny;
+      if (vn < 0) { vx -= vn * nx; vy -= vn * ny; }          // inelastic
+      const tx = -ny, ty = nx;                                // tangent
+      // Surface velocity in per-substep units (px), matching vx/vy which are
+      // per-substep displacements. (Blending against px/s here would inject
+      // energy ~1/dt too large - the source of the runaway uphill launch.)
+      const svx = -S.vStep * cT * P.DT, svy = -S.vStep * sT * P.DT;
+      let vt = vx * tx + vy * ty;
+      const vst = svx * tx + svy * ty;
+      vt += (vst - vt) * P.FRICTION;
+      const vnn = vx * nx + vy * ny;
+      vx = nx * vnn + tx * vt;
+      vy = ny * vnn + ty * vt;
+      p.px = p.x - vx; p.py = p.y - vy;
+      return true;
+    }
+
+    // ---- one fixed substep -------------------------------------------------
+    function subStep() {
+      const dt = P.DT;
+      const sc = S.scroll;
+
+      // escalator speed: held -> idle speed; tumbling -> feedback controller
+      let vDesired;
+      if (S.mode === "held") {
+        vDesired = P.V_BASE * P.V_IDLE_FRAC;
+      } else {
+        const err = Math.max(-P.ERR_CLAMP, Math.min(P.ERR_CLAMP, S.comS - S.targetS));
+        vDesired = P.V_BASE + P.KP * err;
+        vDesired = Math.max(P.V_MIN, Math.min(P.V_SPEED_MAX, vDesired));
+      }
+      const alpha = 1 - Math.exp(-dt / P.TAU);
+      S.vStep += (vDesired - S.vStep) * alpha;
+      S.scroll += S.vStep * dt;
+
+      // ---- held: kinematic hold ----------------------------------------
+      // An invisible hand keeps the horseshoe rigid in the step frame: the
+      // pose is re-enforced every substep (no solver, no drift, no explosion)
+      // and every coil carries exactly the step surface velocity. The pose
+      // is safe by construction, so no collision pass is needed.
+      if (S.mode === "held") {
+        const svx = -S.vStep * cT, svy = -S.vStep * sT;
+        for (let k = 0; k < N; k++) {
+          const p = S.pts[k];
+          const tp = heldPose(k);
+          p.px = tp.x - svx * dt; p.py = tp.y - svy * dt;
+          p.x = tp.x; p.y = tp.y;
+        }
+        const c = S.pts[FOLD];
+        S.anchor.x = c.x; S.anchor.y = c.y;
+        S.anchor.px = c.px; S.anchor.py = c.py;
+        S.contactCount = 0;
+        let hx = 0, hy = 0;
+        for (const p of S.pts) { hx += p.x; hy += p.y; }
+        S.comX = hx / N; S.comY = hy / N;
+        S.comS = S.comX * cT + S.comY * sT;
+        S.t += dt;
+        return;
+      }
+
+      // integrate (Verlet). bx/by remember the start-of-substep position so
+      // the end-of-substep cap can clamp the TOTAL displacement (collide()
+      // rewrites px for its velocity projection, so px is not a safe ref).
+      const g = P.G;
+      for (const p of S.pts) {
+        const vx = (p.x - p.px) * P.DAMP;
+        const vy = (p.y - p.py) * P.DAMP;
+        p.bx = p.x; p.by = p.y;
+        p.px = p.x; p.py = p.y;
+        p.x += vx;
+        p.y += vy + g * dt * dt;
+      }
+
+      // constraint passes
+      const L0 = P.L0;
+      const Lmin = L0 * P.L_MIN_FRAC;
+      for (let it = 0; it < P.ITER; it++) {
+        for (let k = 0; k < N - 1; k++) {
+          const a = S.pts[k], b = S.pts[k + 1];
+          let dx = b.x - a.x, dy = b.y - a.y;
+          let d = Math.sqrt(dx * dx + dy * dy);
+          if (d < 1e-9) { dx = 1e-9; dy = 0; d = 1e-9; }
+          if (d > L0) {
+            const f = ((d - L0) / d) * P.STRETCH_K * 0.5;
+            a.x += dx * f; a.y += dy * f;
+            b.x -= dx * f; b.y -= dy * f;
+          } else if (d < Lmin) {
+            const f = ((Lmin - d) / d) * P.COMPRESS_K * 0.5;
+            a.x -= dx * f; a.y -= dy * f;
+            b.x += dx * f; b.y += dy * f;
+          }
+        }
+        // weak anti-kink: keep i-1 and i+1 from fully folding on each other.
+        // Only active when the adjacent segments are stretched; nested
+        // (compressed) coils in the folded bundle are allowed to sit tight.
+        if (P.BEND_K > 0) {
+          const rest = L0 * 2;
+          for (let k = 1; k < N - 1; k++) {
+            const a = S.pts[k - 1], m = S.pts[k], b = S.pts[k + 1];
+            const s1 = Math.hypot(m.x - a.x, m.y - a.y);
+            const s2 = Math.hypot(b.x - m.x, b.y - m.y);
+            if (s1 < 0.5 * L0 || s2 < 0.5 * L0) continue;
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const d = Math.sqrt(dx * dx + dy * dy);
+            if (d < rest && d > 1e-9) {
+              const f = ((rest - d) / rest) * P.BEND_K * 0.5;
+              const fx = dx * f, fy = dy * f;
+              a.x -= fx; a.y -= fy;
+              b.x += fx; b.y += fy;
+            }
+          }
+        }
+        // coil self-collision (nesting): a coil cannot pass through the coil
+        // two ahead. Real slinky coils are rings: they nest but never
+        // interpenetrate. This one-sided floor is what supports the folded
+        // bundle (each coil rests on the coil two below it) and what makes the
+        // fold push its way through the bundle when it flips.
+        if (P.NEST_K > 0) {
+          const dn = P.D_NEST;
+          for (let k = 0; k < N - 2; k++) {
+            // The fold hinge pair (13,15) is exempt: in 2D the two arms' top
+            // coils sit side by side (z-offset in a real slinky), so they are
+            // allowed to overlap. Enforcing D_NEST on them would detonate the
+            // bundle the instant the fold is released.
+            if (k === FOLD - 1) continue;
+            const a = S.pts[k], b = S.pts[k + 2];
+            let dx = b.x - a.x, dy = b.y - a.y;
+            let d = Math.sqrt(dx * dx + dy * dy);
+            if (d < dn && d > 1e-9) {
+              const f = Math.min(0.25, ((dn - d) / dn) * P.NEST_K);
+              a.x -= dx * f; a.y -= dy * f;
+              b.x += dx * f; b.y += dy * f;
+            }
+          }
+        }
+      }
+
+      // collisions + friction
+      let contacts = 0;
+      for (const p of S.pts) {
+        if (collide(p)) contacts++;
+      }
+      S.contactCount = contacts;
+
+      // hard cap: clamp the coil's position so the total displacement this
+      // substep (integration + solver + collision) cannot exceed V_CAP*dt.
+      // Clamping the position (not px) means a solver teleport is undone,
+      // not just hidden in the recorded velocity.
+      const capPx = P.V_CAP * dt;
+      for (const p of S.pts) {
+        const vx = p.x - p.bx, vy = p.y - p.by;
+        const sp = Math.hypot(vx, vy);
+        if (sp > capPx) {
+          const f = capPx / sp;
+          p.x = p.bx + vx * f;
+          p.y = p.by + vy * f;
+          p.px = p.bx; p.py = p.by;   // next-step velocity = clamped move
+        }
+      }
+
+      // center of mass in slope coordinates (downhill positive)
+      let sx = 0, sy = 0;
+      for (const p of S.pts) { sx += p.x; sy += p.y; }
+      S.comX = sx / N; S.comY = sy / N;
+      S.comS = S.comX * cT + S.comY * sT;
+      S.t += dt;
+    }
+
+    S.targetS = P.COM_TARGET_X * cT + P.COM_TARGET_Y * sT;
+    S.step = step;
+    S.drop = drop;
+    S.reset = reset;
+
+    function step(frameDt) {
+      // fixed-timestep accumulator
+      S.acc = (S.acc || 0) + frameDt;
+      const dt = P.DT;
+      let n = 0;
+      while (S.acc >= dt && n < 8) { subStep(false); S.acc -= dt; n++; }
+      if (n === 8) S.acc = 0; // don't spiral if tab was hidden
+      return n;
+    }
+
+    reset();
+    return S;
+  }
+
+  return { P0, makeSim };
+})();
+/*PHYSICS-END*/
+
+
+/* ============================ RENDERING ============================ */
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+const sim = PHYSICS.makeSim({});
+const P = sim.P;
+const cT = sim.cT, sT = sim.sT;
+const N = sim.N;
+
+// rainbow for coil k
+function hueOf(k) { return (k / (N - 1)) * 300; }   // red -> magenta
+function coilColor(k, light = 55, sat = 95) {
+  return `hsl(${hueOf(k)}, ${sat}%, ${light}%)`;
+}
+function coilColorDark(k) { return `hsl(${hueOf(k)}, 80%, 34%)`; }
+
+// ---- escalator drawing -------------------------------------------------
+function profileNose(i, scroll) {
+  // front (right) edge of tread i, in world coords
+  return {
+    x: P.X0 + (i + 1) * P.TW - scroll * cT,
+    y: P.Y0 + i * P.RH - scroll * sT,
+  };
+}
+
+function drawEscalator() {
+  const scroll = sim.scroll;
+  // visible step range
+  let iMin = Math.floor((0 - P.X0 + scroll * cT) / P.TW) - 2;
+  let iMax = Math.floor((W - P.X0 + scroll * cT) / P.TW) + 3;
+  iMin = Math.max(iMin, iMax - 60); iMax = Math.min(iMax, iMin + 60);
+
+  // --- side balustrade: the solid mass below the step profile ---
+  const n0 = profileNose(iMin, scroll);
+  const n1 = profileNose(iMax, scroll);
+  // unit normal pointing into the solid (down-left from the nose line)
+  const ox = -sT * 700, oy = cT * 700;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(n0.x, n0.y);
+  ctx.lineTo(n1.x, n1.y);
+  ctx.lineTo(n1.x + ox, n1.y + oy);
+  ctx.lineTo(n0.x + ox, n0.y + oy);
+  ctx.closePath();
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, "#28324a");
+  bg.addColorStop(1, "#121724");
+  ctx.fillStyle = bg;
+  ctx.fill();
+  // bright edge where the balustrade meets the step line
+  ctx.strokeStyle = "rgba(255,255,255,.10)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(n0.x, n0.y);
+  ctx.lineTo(n1.x, n1.y);
+  ctx.stroke();
+  ctx.restore();
+
+  // --- steps ---
+  for (let i = iMin; i <= iMax; i++) {
+    const a = profileNose(i, scroll);
+    const xL = a.x - P.TW;               // tread left edge
+    const y = a.y;
+    // riser face (below the nosing, dropping to the next tread)
+    ctx.fillStyle = "#39435c";
+    ctx.fillRect(a.x - 3, y, 6, P.RH);
+    ctx.fillStyle = "rgba(0,0,0,.28)";
+    ctx.fillRect(a.x + 1, y, 2, P.RH);
+    // tread plate
+    ctx.fillStyle = "#5a6580";
+    ctx.fillRect(xL, y, P.TW, 7);
+    // tread top highlight
+    ctx.fillStyle = "#909cb8";
+    ctx.fillRect(xL, y, P.TW, 2);
+    // rubber nosing at the front edge
+    ctx.fillStyle = "#141824";
+    ctx.fillRect(a.x - 4, y - 1, 5, 9);
+    // subtle groove on the tread (sells the motion)
+    ctx.fillStyle = "rgba(255,255,255,.06)";
+    ctx.fillRect(xL + 8, y + 4, P.TW - 16, 1);
+  }
+
+  // --- handrail: band parallel to the nose line, above the steps ---
+  const hl = 118; // rail height above the nose line
+  const ra = { x: -40, y: noseYatX(-40, scroll) - hl };
+  const rb = { x: W + 40, y: noseYatX(W + 40, scroll) - hl };
+  ctx.save();
+  // side panel band just under the rail
+  ctx.strokeStyle = "#2a3145";
+  ctx.lineWidth = 16;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(ra.x, ra.y + 26);
+  ctx.lineTo(rb.x, rb.y + 26);
+  ctx.stroke();
+  // scrolling stripe on the panel (shows the rail moving)
+  ctx.strokeStyle = "rgba(140,155,190,.25)";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([18, 34]);
+  ctx.lineDashOffset = scroll;
+  ctx.beginPath();
+  ctx.moveTo(ra.x, ra.y + 26);
+  ctx.lineTo(rb.x, rb.y + 26);
+  ctx.stroke();
+  // the rail itself
+  ctx.strokeStyle = "#171b26";
+  ctx.lineWidth = 11;
+  ctx.beginPath();
+  ctx.moveTo(ra.x, ra.y);
+  ctx.lineTo(rb.x, rb.y);
+  ctx.stroke();
+  // moving sheen on the rail
+  ctx.strokeStyle = "rgba(255,255,255,.16)";
+  ctx.lineWidth = 4;
+  ctx.setLineDash([26, 34]);
+  ctx.lineDashOffset = scroll;
+  ctx.beginPath();
+  ctx.moveTo(ra.x, ra.y - 2.5);
+  ctx.lineTo(rb.x, rb.y - 2.5);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // --- "UP" marker riding the balustrade ---
+  drawUpMarker(scroll);
+}
+
+function noseYatX(x, scroll) {
+  // y of the nose line (line through tread noses) at world x
+  const i = Math.floor((x - P.X0 + scroll * cT) / P.TW);
+  // nose of step i at x = P.X0 + (i+1)*TW - scroll*cT; interpolate along tread?
+  // The nose line is the line through all noses: slope RH/TW
+  const nose0x = P.X0 + P.TW, nose0y = P.Y0;
+  return nose0y + ((x - (nose0x - scroll * cT)) / (P.TW)) * P.RH - scroll * sT;
+}
+
+function drawUpMarker(scroll) {
+  // a small green "up" chevron that rides the steps, on the balustrade
+  const targetX = 120;
+  // find step whose nose is nearest targetX
+  const i = Math.round((targetX - P.X0 + scroll * cT) / P.TW);
+  const n = profileNose(i, scroll);
+  // offset into the solid (down-left from the nose line) so it rides the panel
+  const x = n.x - sT * 44, y = n.y + cT * 44 + 6;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.atan2(-cT, sT)); // point the arrow up the slope
+  ctx.fillStyle = "rgba(120,255,170,.8)";
+  ctx.beginPath();
+  ctx.moveTo(0, -7); ctx.lineTo(5, 2); ctx.lineTo(2, 2);
+  ctx.lineTo(2, 8); ctx.lineTo(-2, 8); ctx.lineTo(-2, 2); ctx.lineTo(-5, 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = "rgba(120,255,170,.5)";
+  ctx.font = "600 9px ui-sans-serif, system-ui";
+  ctx.fillText("UP", 8, 3);
+  ctx.restore();
+}
+
+// ---- slinky drawing ----------------------------------------------------
+function slinkyPath() {
+  const pts = sim.pts;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let k = 1; k < N - 1; k++) {
+    const mx = (pts[k].x + pts[k + 1].x) / 2;
+    const my = (pts[k].y + pts[k + 1].y) / 2;
+    ctx.quadraticCurveTo(pts[k].x, pts[k].y, mx, my);
+  }
+  ctx.lineTo(pts[N - 1].x, pts[N - 1].y);
+}
+
+function drawSlinky() {
+  const pts = sim.pts;
+  ctx.save();
+
+  // soft shadow
+  ctx.save();
+  ctx.translate(7, 12);
+  ctx.globalAlpha = 0.28;
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  slinkyPath();
+  ctx.strokeStyle = "#000";
+  ctx.lineWidth = P.R * 2.1;
+  ctx.stroke();
+  ctx.restore();
+
+  // dark outline pass
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  slinkyPath();
+  ctx.strokeStyle = "rgba(10,12,18,.9)";
+  ctx.lineWidth = P.R * 2.35;
+  ctx.stroke();
+
+  // rainbow body, per-segment hue
+  for (let k = 0; k < N - 1; k++) {
+    const a = pts[k], b = pts[k + 1];
+    const g = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+    g.addColorStop(0, coilColor(k, 58));
+    g.addColorStop(1, coilColor(k + 1, 58));
+    ctx.strokeStyle = g;
+    ctx.lineWidth = P.R * 1.7;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  // glossy top highlight
+  slinkyPath();
+  ctx.strokeStyle = "rgba(255,255,255,.18)";
+  ctx.lineWidth = P.R * 0.7;
+  ctx.stroke();
+
+  // coil rings: each coil gets its own hue
+  for (let k = 0; k < N; k++) {
+    const p = pts[k];
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, P.R * 0.95, 0, Math.PI * 2);
+    ctx.strokeStyle = coilColorDark(k);
+    ctx.lineWidth = 2.4;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x - P.R * 0.3, p.y - P.R * 0.35, P.R * 0.38, 0, Math.PI * 2);
+    ctx.fillStyle = coilColor(k, 82, 100);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---- background ---------------------------------------------------------
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#182034");
+  g.addColorStop(0.55, "#141a2b");
+  g.addColorStop(1, "#0e1220");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // soft glow behind the action
+  const r = ctx.createRadialGradient(430, 330, 40, 430, 330, 460);
+  r.addColorStop(0, "rgba(120,140,255,.10)");
+  r.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = r;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ---- status HUD ----------------------------------------------------------
+const statusEl = document.getElementById("status");
+const dropBtn = document.getElementById("dropBtn");
+let lastStatusText = "";
+function updateStatus() {
+  let txt;
+  if (sim.mode === "held") {
+    txt = `held over the step<br>press <b>Drop</b> to let go`;
+  } else {
+    const speed = sim.vStep;
+    const drift = sim.comS - sim.targetS;
+    txt = `tumbling in place<br>escalator <b>${speed.toFixed(0)} px/s</b> up &nbsp;·&nbsp; com drift <b>${drift >= 0 ? "+" : ""}${drift.toFixed(0)} px</b>`;
+  }
+  if (txt !== lastStatusText) {
+    statusEl.innerHTML = txt;
+    lastStatusText = txt;
+  }
+}
+
+// ---- main loop -----------------------------------------------------------
+let lastT = performance.now();
+function frame(now) {
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  if (dt > 0.1) dt = 0.1;
+  sim.step(dt);
+
+  drawBackground();
+  drawEscalator();
+  drawSlinky();
+  updateStatus();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- controls -------------------------------------------------------------
+function doDrop() {
+  if (sim.mode !== "held") return;
+  sim.drop();
+  dropBtn.disabled = true;
+}
+function doReset() {
+  sim.reset();
+  dropBtn.disabled = false;
+}
+dropBtn.addEventListener("click", doDrop);
+document.getElementById("resetBtn").addEventListener("click", doReset);
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); doDrop(); }
+  if (e.code === "KeyR") doReset();
+});
+dropBtn.disabled = false;
+</script>
+</body>
+</html>
